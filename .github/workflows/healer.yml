@@ -19,6 +19,7 @@ on:
 
 env:
   ORDERING_CHECK: gate
+  RFC_CHECK: rfc-gate
 
 jobs:
   heal:
@@ -47,24 +48,25 @@ jobs:
           GH_TOKEN: ${{ steps.token.outputs.token }}
         run: ./scripts/classify-ejection.sh
 
-      - name: non-ordering failure — leave for a human
+      - name: non-healable failure — leave for a human
         if: ${{ steps.classify.outputs.cause == 'other' }}
         run: |
-          echo "::warning::PR #$PR ejected by a non-ordering required check; not healing or re-queuing"
+          echo "::warning::PR #$PR ejected by a non-healable required check; not healing or re-queuing"
 
+      # ---------- migration ordering heal (cause = ordering | none) ----------
       - name: heal ordering (rename if out-of-order)
         id: heal
-        if: ${{ steps.classify.outputs.cause != 'other' }}
+        if: ${{ steps.classify.outputs.cause == 'ordering' || steps.classify.outputs.cause == 'none' }}
         run: ./scripts/heal.sh
 
       - name: does ordering pass now?
         id: verify
-        if: ${{ steps.classify.outputs.cause != 'other' }}
+        if: ${{ steps.classify.outputs.cause == 'ordering' || steps.classify.outputs.cause == 'none' }}
         run: |
           if ./scripts/check-order.sh; then echo "ok=true" >> "$GITHUB_OUTPUT"; else echo "ok=false" >> "$GITHUB_OUTPUT"; fi
 
-      - name: push heal commit, then wait for GitHub to register it
-        if: ${{ steps.classify.outputs.cause != 'other' && steps.heal.outputs.changed == 'true' && steps.verify.outputs.ok == 'true' }}
+      - name: push ordering heal, then wait for GitHub to register it
+        if: ${{ (steps.classify.outputs.cause == 'ordering' || steps.classify.outputs.cause == 'none') && steps.heal.outputs.changed == 'true' && steps.verify.outputs.ok == 'true' }}
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
@@ -77,8 +79,8 @@ jobs:
             echo "waiting: head=$head gate=$gate (want $sha/SUCCESS)"; sleep 5
           done
 
-      - name: re-queue (only if ordering passes — no loop on other failures)
-        if: ${{ steps.classify.outputs.cause != 'other' && steps.verify.outputs.ok == 'true' }}
+      - name: re-queue ordering heal (only if ordering passes)
+        if: ${{ (steps.classify.outputs.cause == 'ordering' || steps.classify.outputs.cause == 'none') && steps.verify.outputs.ok == 'true' }}
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
@@ -86,5 +88,61 @@ jobs:
           echo "re-queued PR #$PR (cause=${{ steps.classify.outputs.cause }} changed=${{ steps.heal.outputs.changed }})"
 
       - name: ordering still broken — leave for a human
-        if: ${{ steps.classify.outputs.cause != 'other' && steps.verify.outputs.ok != 'true' }}
+        if: ${{ (steps.classify.outputs.cause == 'ordering' || steps.classify.outputs.cause == 'none') && steps.verify.outputs.ok != 'true' }}
         run: echo "::warning::ordering check still failing on PR #$PR after heal attempt; not re-queuing"
+
+      # ---------- RFC collision heal (cause = rfc) ----------
+      # Deterministic codemod: rename file + patch H1 + patch the one index line.
+      # heal-rfc.sh commits that and reports complex=true|false.
+      - name: heal RFC collision (renumber)
+        id: healrfc
+        if: ${{ steps.classify.outputs.cause == 'rfc' }}
+        run: ./scripts/heal-rfc.sh
+
+      # CLEAN: the old number survived nowhere -> safe to auto-merge. Push, wait for
+      # the RFC gate to go green on the new head, re-queue. Zero-touch.
+      - name: push RFC heal, then wait for GitHub to register it
+        if: ${{ steps.classify.outputs.cause == 'rfc' && steps.healrfc.outputs.changed == 'true' && steps.healrfc.outputs.complex == 'false' }}
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          git push origin "HEAD:${BRANCH}"
+          sha=$(git rev-parse HEAD)
+          for i in $(seq 1 60); do
+            head=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
+            gate=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json statusCheckRollup --jq '[.statusCheckRollup[]|select(.name=="rfc-gate")|.conclusion]|last // ""')
+            if [ "$head" = "$sha" ] && [ "$gate" = "SUCCESS" ]; then echo "registered: head=$head rfc-gate=$gate"; break; fi
+            echo "waiting: head=$head rfc-gate=$gate (want $sha/SUCCESS)"; sleep 5
+          done
+
+      - name: re-queue RFC heal (clean only)
+        if: ${{ steps.classify.outputs.cause == 'rfc' && steps.healrfc.outputs.changed == 'true' && steps.healrfc.outputs.complex == 'false' }}
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --auto
+          echo "re-queued PR #$PR (RFC ${{ steps.healrfc.outputs.old }} -> ${{ steps.healrfc.outputs.new }}, clean)"
+
+      # COMPLEX: the old number is referenced in prose / elsewhere in the PR. An LLM
+      # rewrites those references (this is the hook — gated on an API key), the result
+      # is pushed, and the PR WAITS for a human to merge. The healer never re-queues a
+      # complex heal: a number identity change in prose is human-reviewed before it lands.
+      - name: LLM-assist remaining references (complex)
+        if: ${{ steps.classify.outputs.cause == 'rfc' && steps.healrfc.outputs.complex == 'true' }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OLD: ${{ steps.healrfc.outputs.old }}
+          NEW: ${{ steps.healrfc.outputs.new }}
+        run: ./scripts/heal-rfc-llm.sh
+
+      - name: push complex heal + ask for human merge (no re-queue)
+        if: ${{ steps.classify.outputs.cause == 'rfc' && steps.healrfc.outputs.complex == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          OLD: ${{ steps.healrfc.outputs.old }}
+          NEW: ${{ steps.healrfc.outputs.new }}
+        run: |
+          git push origin "HEAD:${BRANCH}"
+          gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body \
+            "🤖 RFC \`${OLD}\` collided with main and was renumbered to \`${NEW}\` (file, H1, and index updated). The old number was also referenced in prose / elsewhere in this PR, so this was **not** auto-merged. Please review the renumbering and merge when ready."
+          echo "::notice::complex RFC heal pushed for PR #$PR; left for human merge"

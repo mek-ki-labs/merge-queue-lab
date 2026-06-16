@@ -5,8 +5,20 @@ set -euo pipefail
 # max, as a PURE RENAME. Sets GITHUB_OUTPUT changed=true|false. Refuses (exit 1)
 # if it would touch anything other than a migration rename — the trust guard.
 # Invoked by the healer workflow after a merge-queue ejection (merged == false).
+#
+# Concurrency (E5): two PRs ejected together both read the same origin/main, so a
+# naive "main_max + 1" makes both healers pick the SAME slot -> duplicate timestamp
+# lands on main (the strict-< check doesn't catch a tie). Fix: derive the new slot
+# from the PR number — new_ts = main_max + PR*100 + idx. PR numbers are globally
+# unique, so concurrent healers get disjoint [PR*100, PR*100+99] blocks; every slot
+# is > main_max (so it can't collide with anything already on main) and distinct
+# across PRs (so it can't collide with a sibling). Lock-free, converges in one heal
+# cycle, no loss of queue concurrency. Caps at 99 migrations rebumped per PR.
 
 cd "$(git rev-parse --show-toplevel)"
+
+PR_NUMBER="${PR:?PR env (github.event.number) required for distinct slot assignment}"
+MAX_PER_PR=99
 
 migration_ts() { basename "$1" | grep -oE '^[0-9]{14}' || true; }
 
@@ -18,16 +30,19 @@ branch_added=$(git diff --diff-filter=AR -M --name-only origin/main...HEAD -- 'm
   | grep -E '^migrations/[0-9]{14}_.*\.sql$' || true)
 
 changed=false
-next=$((10#$main_max))
+block_base=$((10#$main_max + PR_NUMBER * 100))
+idx=0
 while IFS= read -r f; do
   [ -z "$f" ] && continue
   ts=$(migration_ts "$f")
-  if [ -n "$ts" ] && [ "$ts" \< "$main_max" ]; then
-    next=$((next + 1))
-    new=$(printf '%014d' "$next")
+  # rebump anything not strictly past main's max — a tie (== main_max) is a duplicate
+  if [ -n "$ts" ] && { [ "$ts" \< "$main_max" ] || [ "$ts" = "$main_max" ]; }; then
+    idx=$((idx + 1))
+    [ "$idx" -gt "$MAX_PER_PR" ] && { echo "more than ${MAX_PER_PR} migrations to rebump on PR #${PR_NUMBER} — refusing"; exit 1; }
+    new=$(printf '%014d' $((block_base + idx)))
     suffix=$(basename "$f" | sed -E 's/^[0-9]{14}_//')
     git mv "$f" "migrations/${new}_${suffix}"
-    echo "rebumped ${f} -> migrations/${new}_${suffix}"
+    echo "rebumped ${f} -> migrations/${new}_${suffix} (PR #${PR_NUMBER} block)"
     changed=true
   fi
 done <<< "$branch_added"

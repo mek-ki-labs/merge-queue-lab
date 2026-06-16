@@ -1,0 +1,20 @@
+name: rfc-gate
+
+# Required status check: RFC number collisions, run on every PR and every
+# merge-queue entry. The merge_group run is authoritative — two PRs that each
+# grabbed the next-free number pass their own PR check, then the loser collides
+# with the updated main once the winner merges and is ejected here, where the
+# healer renumbers it. Mirrors gate.yml (migration ordering).
+
+on:
+  pull_request:
+  merge_group:
+
+jobs:
+  rfc-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: ./scripts/check-rfc.sh

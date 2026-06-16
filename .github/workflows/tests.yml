@@ -1,9 +1,11 @@
 name: tests
 
-# A second required check (stands in for chi's lint/typecheck/worker:test). It
-# fails when a PR contains the marker file `tests-should-fail`, letting the lab
-# simulate a non-ordering ejection so we can prove the healer refuses to
-# auto-re-queue PRs that were ejected for reasons other than migration ordering.
+# A second required check (stands in for chi's lint/typecheck/worker:test). To
+# simulate a NON-ordering merge-queue ejection deterministically it passes on the
+# PR itself (so the PR can enter the queue) but fails inside the merge group when
+# the marker file `tests-should-fail` is present — mimicking a check that only
+# breaks once the PR is combined with main. This lets the lab prove the healer
+# refuses to auto-re-queue PRs ejected for reasons other than migration ordering.
 
 on:
   pull_request:
@@ -14,7 +16,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: fail if marker present
+      - name: fail in merge_group if marker present
         run: |
-          if [ -f tests-should-fail ]; then echo "marker present — failing"; exit 1; fi
-          echo "no marker — passing"
+          if [ "${{ github.event_name }}" = "merge_group" ] && [ -f tests-should-fail ]; then
+            echo "marker present in merge group — failing"; exit 1
+          fi
+          echo "passing (event=${{ github.event_name }})"

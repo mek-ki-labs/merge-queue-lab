@@ -1,11 +1,16 @@
 name: healer
 
-# Self-heals an out-of-order migration after the merge queue ejects the PR.
-# Guard 1 (E1): only act when merged == false — dequeued fires on merge too.
-# Guard 2: heal.sh only rewrites if there is actually an ordering violation,
-#          and refuses anything but a pure migration rename (trust guard).
-# Pushes under the App token (the default GITHUB_TOKEN cannot re-trigger the
-# gate), then re-queues via gh pr merge --auto.
+# v2. Self-heals an out-of-order migration after a merge-queue ejection.
+#   Guard 1 (E1): only act when merged == false (dequeued fires on merge too).
+#   Guard 2: heal.sh refuses anything but a pure migration rename (trust guard).
+#   Guard 3 (loop-safety): re-queue ONLY when the ordering check passes on the
+#            current head — a non-ordering failure is never re-queued, so no loop.
+#   Race fix: after pushing the heal commit, wait until GitHub registers the new
+#            head AND the PR gate goes green on it BEFORE re-queuing, else the
+#            merge queue rebuilds from the stale pre-heal head and re-fails.
+#   Stranding fix: re-queue is gated on the ordering check passing, NOT on
+#            "did we rename" — so a stale-race ejection of an already-valid
+#            branch still gets re-queued.
 
 on:
   pull_request:
@@ -15,6 +20,9 @@ jobs:
   heal:
     if: ${{ !github.event.pull_request.merged }}
     runs-on: ubuntu-latest
+    env:
+      PR: ${{ github.event.number }}
+      BRANCH: ${{ github.event.pull_request.head.ref }}
     steps:
       - name: mint App token
         id: token
@@ -29,15 +37,37 @@ jobs:
           fetch-depth: 0
           token: ${{ steps.token.outputs.token }}
 
-      - name: heal ordering
+      - name: heal ordering (rename if out-of-order)
         id: heal
         run: ./scripts/heal.sh
 
-      - name: push + re-queue
-        if: ${{ steps.heal.outputs.changed == 'true' }}
+      - name: does ordering pass now?
+        id: verify
+        run: |
+          if ./scripts/check-order.sh; then echo "ok=true" >> "$GITHUB_OUTPUT"; else echo "ok=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: push heal commit, then wait for GitHub to register it
+        if: ${{ steps.heal.outputs.changed == 'true' && steps.verify.outputs.ok == 'true' }}
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
-          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
-          gh pr merge ${{ github.event.number }} --repo "${{ github.repository }}" --auto
-          echo "healed and re-queued PR #${{ github.event.number }}"
+          git push origin "HEAD:${BRANCH}"
+          sha=$(git rev-parse HEAD)
+          for i in $(seq 1 60); do
+            head=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)
+            gate=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json statusCheckRollup --jq '[.statusCheckRollup[]|select(.name=="gate")|.conclusion]|last // ""')
+            if [ "$head" = "$sha" ] && [ "$gate" = "SUCCESS" ]; then echo "registered: head=$head gate=$gate"; break; fi
+            echo "waiting: head=$head gate=$gate (want $sha/SUCCESS)"; sleep 5
+          done
+
+      - name: re-queue (only if ordering passes — no loop on other failures)
+        if: ${{ steps.verify.outputs.ok == 'true' }}
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --auto
+          echo "re-queued PR #$PR (changed=${{ steps.heal.outputs.changed }})"
+
+      - name: ordering still broken — leave for a human
+        if: ${{ steps.verify.outputs.ok != 'true' }}
+        run: echo "::warning::ordering check still failing on PR #$PR after heal attempt; not re-queuing"

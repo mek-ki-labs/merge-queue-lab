@@ -1,4 +1,4 @@
-# RFC 0008: Theta
+# RFC 0009: Theta
 
 ## Background
 

@@ -42,7 +42,9 @@ changed=false
 complex=false
 old=""; new=""; slug=""
 next=$((10#$main_max))
+olds=(); newfs=()
 
+# --- mechanical codemod: rename + H1 + index, stage ---
 while IFS= read -r f; do
   [ -z "$f" ] && continue
   n=$(rfc_num "$f")
@@ -68,46 +70,54 @@ while IFS= read -r f; do
 
   git add "$newf" "$readme" 2>/dev/null || git add "$newf"
   changed=true
-
-  # complex scan: does the OLD number survive anywhere the heal should have a say?
-  #   (a) in the renamed RFC body, below the H1 we patched
-  #   (b) anywhere else this PR added/changed lines (code/docs citing the old number)
-  # Bias to safety: a bare \bNNNN\b match routes to human review. Over-matching just
-  # asks for a human; under-matching would auto-merge a dangling reference.
-  body_refs=$(tail -n +2 "$newf" | grep -w "$n" || true)
-  diff_refs=$(git diff origin/main...HEAD -- . ":(exclude)${newf}" ":(exclude)${readme}" \
-    | sed -n 's/^+//p' | grep -v '^+' | grep -w "$n" || true)
-  if [ -n "$body_refs" ] || [ -n "$diff_refs" ]; then
-    complex=true
-    echo "complex: old number ${n} still referenced after codemod:"
-    [ -n "$body_refs" ] && printf '  body: %s\n' "$body_refs"
-    [ -n "$diff_refs" ] && printf '  diff: %s\n' "$diff_refs"
-  fi
-
+  olds+=("$n"); newfs+=("$newf")
   echo "renumbered ${f} -> ${newf} (RFC ${n} -> ${newn})"
 done <<< "$branch_added"
 
 if [ "$changed" = true ]; then
-  if [ "$complex" = false ]; then
-    # TRUST GUARD (clean path only): the staged change set must be exactly the renamed
-    # RFC file (rename + an H1 line edit) and at most the README index line. Anything
-    # else means the codemod assumption is wrong — refuse the clean auto-path. The
-    # complex path skips this because the LLM step (run by the workflow) will edit
-    # prose, and that result is human-gated, not auto-merged.
-    while IFS=$'\t' read -r status path rest; do
-      case "$status" in
-        R*) echo "$path" | grep -qE '^docs/rfcs/[0-9]{4}-.*\.md$' || { echo "trust guard: unexpected rename $path"; exit 1; } ;;
-        M*) [ "$path" = "$readme" ] || echo "$path" | grep -qE '^docs/rfcs/[0-9]{4}-.*\.md$' || { echo "trust guard: unexpected edit $path"; exit 1; } ;;
-        A*) echo "$path" | grep -qE '^docs/rfcs/[0-9]{4}-.*\.md$' || { echo "trust guard: unexpected add $path"; exit 1; } ;;
-        "") : ;;
-        *)  echo "trust guard: unexpected change ($status $path)"; exit 1 ;;
-      esac
-    done < <(git diff --cached -M --name-status)
-  fi
+  # TRUST GUARD (always): the deterministic codemod's staged change set must be exactly
+  # renamed RFC file(s) (rename + an H1 line edit) and at most the README index line.
+  # Anything else means the codemod assumption is wrong — refuse. This guards the
+  # mechanical commit; the complex path's later LLM edit is a separate human-gated commit.
+  while IFS=$'\t' read -r status path rest; do
+    # A small RFC whose H1 changes can drop below git's rename-similarity threshold and
+    # show as D(old)+A(new) instead of R — both halves are docs/rfcs RFC files, so allow
+    # D/A/R of docs/rfcs/NNNN-*.md and an M of the README index. Nothing else.
+    case "$status" in
+      R*|A*|D*) echo "$path" | grep -qE '^docs/rfcs/[0-9]{4}-.*\.md$' || { echo "trust guard: unexpected ${status} $path"; exit 1; } ;;
+      M*) [ "$path" = "$readme" ] || echo "$path" | grep -qE '^docs/rfcs/[0-9]{4}-.*\.md$' || { echo "trust guard: unexpected edit $path"; exit 1; } ;;
+      "") : ;;
+      *)  echo "trust guard: unexpected change ($status $path)"; exit 1 ;;
+    esac
+  done < <(git diff --cached -M --name-status)
 
   git -c user.name="mek-ki-labs-healer[bot]" \
       -c user.email="mek-ki-labs-healer[bot]@users.noreply.github.com" \
       commit -q -m "heal: renumber colliding RFC ${old} -> ${new}"
+
+  # --- clean vs complex: scan the HEALED tree (post-commit) for any surviving ref to an
+  # old number. Must run AFTER the commit: before it, HEAD still adds the OLD-numbered
+  # file, so the net diff would always show the old number and every heal would look
+  # complex. After the commit the net diff vs origin/main shows only the NEW name.
+  #   (a) the renamed RFC body, below the patched H1
+  #   (b) anywhere else this PR added (code/docs citing the old number), excluding the
+  #       renamed files and the README index line
+  # Bias to safety: a bare word-match routes to human review. Over-match just asks for a
+  # human; under-match would auto-merge a dangling reference.
+  excludes=(":(exclude)${readme}")
+  for nf in "${newfs[@]}"; do excludes+=(":(exclude)${nf}"); done
+  for i in "${!olds[@]}"; do
+    n="${olds[$i]}"; nf="${newfs[$i]}"
+    body_refs=$(tail -n +2 "$nf" | grep -w "$n" || true)
+    diff_refs=$(git diff origin/main...HEAD -- . "${excludes[@]}" \
+      | sed -n 's/^+//p' | grep -v '^+' | grep -w "$n" || true)
+    if [ -n "$body_refs" ] || [ -n "$diff_refs" ]; then
+      complex=true
+      echo "complex: old number ${n} still referenced after codemod:"
+      [ -n "$body_refs" ] && printf '  body: %s\n' "$body_refs"
+      [ -n "$diff_refs" ] && printf '  diff: %s\n' "$diff_refs"
+    fi
+  done
 fi
 
 {

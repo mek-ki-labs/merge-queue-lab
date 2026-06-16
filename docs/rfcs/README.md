@@ -8,3 +8,4 @@ filesystem (mirrors chi). Each line dual-encodes the number in the link and the 
 - [0003-alpha.md](0003-alpha.md) — RFC 0003: Alpha
 - [0005-delta.md](0005-delta.md) — RFC 0005: Delta
 - [0007-zeta.md](0007-zeta.md) — RFC 0007: Zeta
+- [0008-theta.md](0008-theta.md) — RFC 0008: Theta

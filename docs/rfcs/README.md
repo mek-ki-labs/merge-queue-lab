@@ -7,3 +7,4 @@ filesystem (mirrors chi). Each line dual-encodes the number in the link and the 
 - [0002-second.md](0002-second.md) — RFC 0002: Second RFC
 - [0003-alpha.md](0003-alpha.md) — RFC 0003: Alpha
 - [0005-delta.md](0005-delta.md) — RFC 0005: Delta
+- [0006-zeta.md](0006-zeta.md) — RFC 0006: Zeta

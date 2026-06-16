@@ -1,10 +1,9 @@
 name: gate
 
-# Required status check. Stand-in for the migration-ordering gate.
-# Passes when a PR carries at most one slot file; FAILS when two slots
-# coexist in the tree — which only happens when two PRs combine in the
-# merge group. This reproduces "passes alone, fails in the queue" → ejection,
-# the exact condition E1 (dequeued semantics) and E2 (refs-in-merge_group) need.
+# Required status check: migration ordering, run on every PR and every
+# merge-queue entry. In the merge_group the check sees the PR's migrations
+# measured against the UPDATED main (E2), so an order collision that only
+# manifests after a sibling PR merges is caught here and ejects the PR.
 
 on:
   pull_request:
@@ -17,26 +16,4 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: E2 diagnostics — what does the check see?
-        run: |
-          echo "event_name = $GITHUB_EVENT_NAME"
-          echo "ref        = $GITHUB_REF"
-          echo "sha        = $GITHUB_SHA"
-          echo "base_ref   = ${GITHUB_BASE_REF:-<none>}"
-          echo "--- recent log ---"
-          git log --oneline -8 || true
-          echo "--- origin/main resolvable? ---"
-          git rev-parse origin/main 2>&1 || echo "origin/main NOT available"
-          echo "--- diff origin/main...HEAD (name-only) ---"
-          git diff --name-only origin/main...HEAD 2>&1 || echo "diff failed"
-          echo "--- slots in tree ---"
-          ls -1 slots/ 2>&1 || echo "no slots dir"
-
-      - name: collision gate
-        run: |
-          if [ -f slots/a.txt ] && [ -f slots/b.txt ]; then
-            echo "COLLISION: slots/a.txt and slots/b.txt both present -> FAIL"
-            exit 1
-          fi
-          echo "OK: at most one slot present"
+      - run: ./scripts/check-order.sh

@@ -1,42 +1,43 @@
 name: healer
 
-# E1: does pull_request:dequeued fire on a merge-queue ejection, and what is in
-# the payload (can we tell ejection from merge/manual-removal)?
-# E3 building block: can we mint a GitHub App installation token here and act with it
-# (the default GITHUB_TOKEN cannot re-trigger workflows; the App token can)?
+# Self-heals an out-of-order migration after the merge queue ejects the PR.
+# Guard 1 (E1): only act when merged == false — dequeued fires on merge too.
+# Guard 2: heal.sh only rewrites if there is actually an ordering violation,
+#          and refuses anything but a pure migration rename (trust guard).
+# Pushes under the App token (the default GITHUB_TOKEN cannot re-trigger the
+# gate), then re-queues via gh pr merge --auto.
 
 on:
   pull_request:
     types: [dequeued]
 
 jobs:
-  observe:
+  heal:
+    if: ${{ !github.event.pull_request.merged }}
     runs-on: ubuntu-latest
     steps:
-      - name: E1 — dump the full dequeued payload
-        run: |
-          echo "===== event payload ====="
-          cat "$GITHUB_EVENT_PATH"
-          echo ""
-          echo "===== fields of interest ====="
-          echo "action        = $(jq -r .action "$GITHUB_EVENT_PATH")"
-          echo "pr number     = $(jq -r .number "$GITHUB_EVENT_PATH")"
-          echo "pr state      = $(jq -r .pull_request.state "$GITHUB_EVENT_PATH")"
-          echo "merged        = $(jq -r .pull_request.merged "$GITHUB_EVENT_PATH")"
-          echo "merge_commit  = $(jq -r .pull_request.merge_commit_sha "$GITHUB_EVENT_PATH")"
-          echo "head sha      = $(jq -r .pull_request.head.sha "$GITHUB_EVENT_PATH")"
-          echo "reason keys   = $(jq -r 'keys | join(\",\")' "$GITHUB_EVENT_PATH")"
-
-      - name: E3 — mint App installation token
-        id: apptoken
+      - name: mint App token
+        id: token
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.HEALER_APP_ID }}
           private-key: ${{ secrets.HEALER_APP_PRIVATE_KEY }}
 
-      - name: E3 — prove the App token can act
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          token: ${{ steps.token.outputs.token }}
+
+      - name: heal ordering
+        id: heal
+        run: ./scripts/heal.sh
+
+      - name: push + re-queue
+        if: ${{ steps.heal.outputs.changed == 'true' }}
         env:
-          GH_TOKEN: ${{ steps.apptoken.outputs.token }}
+          GH_TOKEN: ${{ steps.token.outputs.token }}
         run: |
-          echo "acting as: $(gh api user 2>/dev/null --jq .login || echo '<app — no user>')"
-          gh api "repos/${GITHUB_REPOSITORY}" --jq '.full_name + " (token OK)"'
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+          gh pr merge ${{ github.event.number }} --repo "${{ github.repository }}" --auto
+          echo "healed and re-queued PR #${{ github.event.number }}"
